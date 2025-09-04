@@ -1,31 +1,44 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.pytest_cache/
-.coverage
-htmlcov/
+# Use auto text detection
+* text=auto
 
-# Jupyter
-.ipynb_checkpoints
-*.ipynb*
+# Normalize line endings for text files
+* text eol=lf
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*~
+# Python files
+*.py text
+
+# Jupyter Notebooks
+*.ipynb text eol=lf
+
+# Markdown and config files
+*.md text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.json text eol=lf
+*.yaml text
+*.yml text
+
+# Shell scripts
+*.sh text eol=lf
+*.bat text eol=crlf
 
 # Logs
-*.log
+*.log text eol=lf
 
-# Environment
-.env
-.venv
-venv/
-env/
-
-# OS
-.DS_Store
-Thumbs.db
+# Binary files - prevent text conversion
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.h5 binary
+*.hdf5 binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.pkl binary
+*.joblib binary
+*.npy binary
+*.npz binary
+*.zip binary
+*.tar.gz binary
