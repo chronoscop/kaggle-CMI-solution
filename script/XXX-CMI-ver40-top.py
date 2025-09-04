@@ -1,5 +1,5 @@
 import os, json, joblib, numpy as np, pandas as pd
-# os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import random, math
 from pathlib import Path
 import warnings 
@@ -12,7 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam, AdamW
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, roc_auc_score
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
@@ -20,10 +20,8 @@ from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
 from timm.scheduler import CosineLRScheduler
 from scipy.signal import firwin
 import sys
-sys.path.append("../kaggle cmi/metric")
+sys.path.append("../metric")
 from cmi_metric import CompetitionMetric
-# 导入scipy的softmax
-from scipy.special import softmax
 from tqdm import tqdm
 from copy import deepcopy
 from IPython.display import clear_output
@@ -32,9 +30,11 @@ from scipy.spatial.transform import Rotation as R
 from types import SimpleNamespace
 from pytorch_metric_learning import losses, miners
 
+
+# Configuration
 TRAIN = True                     
-RAW_DIR = Path("../kaggle_cmi_comp/cmi-detect-behavior-with-sensor-data")
-EXPORT_DIR = Path("./")                                   
+RAW_DIR = Path("../data")
+EXPORT_DIR = Path("../models")                                   
 BATCH_SIZE = 64
 PAD_PERCENTILE = 100
 maxlen = PAD_PERCENTILE
@@ -42,8 +42,8 @@ LR_INIT = 1e-3
 WD = 3e-3
 MIXUP_ALPHA = 0.4
 MASKING_PROB = 0.25
-PATIENCE = 40
-FOLDS = 5
+PATIENCE = 30
+FOLDS = 10
 random_state = 42
 epochs_warmup = 20
 warmup_lr_init = 1.822126131809773e-05
@@ -77,7 +77,6 @@ class ImuFeatureExtractor(nn.Module):
         linear_acc      = imu[:, 7:10, :]
         angular_vel     = imu[:, 10:13, :]
         angular_distance = imu[:, 13:14, :] 
- 
 
         # 线性加速度的幅度和jerk
         linear_acc_mag = torch.norm(linear_acc, dim=1, keepdim=True)
@@ -118,7 +117,7 @@ class ImuFeatureExtractor(nn.Module):
             gyro_delta, gyro_pow,
             gyro_lpf, gyro_hpf,
             angular_vel, angular_vel_mag, angular_vel_mag_jerk, angular_distance,
-            rot_angle, rot_angle_vel,
+            rot_angle, rot_angle_vel
         ]
         # print(torch.cat(acc_features, dim=1).shape, torch.cat(gyro_features, dim=1).shape)
         features = acc_features + gyro_features
@@ -188,21 +187,8 @@ class ResidualSECNNBlock(nn.Module):
         
         return out
 
-class AttentionLayer(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.attention = nn.Linear(hidden_dim, 1)
-        
-    def forward(self, x):
-        # x shape: (batch, seq_len, hidden_dim)
-        scores = torch.tanh(self.attention(x))  # (batch, seq_len, 1)
-        weights = F.softmax(scores.squeeze(-1), dim=1)  # (batch, seq_len)
-        context = torch.sum(x * weights.unsqueeze(-1), dim=1)  # (batch, hidden_dim)
-        return context
-
-# %%
-class TwoBranchModel(nn.Module):
-    def __init__(self, pad_len, imu_dim_raw, tof_dim, n_classes, dropouts=[0.3, 0.3, 0.3, 0.3, 0.4, 0.5, 0.3], 
+class FuseGate(nn.Module):
+    def __init__(self, pad_len, imu_dim_raw, tof_dim, n_classes, dropouts=[0.25, 0.25, 0.25, 0.25, 0.32, 0.4, 0.3], 
                  feature_engineering=True, **kwargs):
         super().__init__()
         self.feature_engineering = feature_engineering
@@ -219,8 +205,8 @@ class TwoBranchModel(nn.Module):
         
 
         # IMU deep branch
-        # self.imu_block1 = ResidualSECNNBlock(imu_dim, 64, 3, 1, dropout=dropouts[0])
-        # self.imu_block2 = ResidualSECNNBlock(64, 128, 5, 1, dropout=dropouts[1])
+        # self.imu_block1 = ResidualSECNNBlock(imu_dim, 64, 3, 1, dropout=dropouts[0], weight_decay=weight_decay)
+        # self.imu_block2 = ResidualSECNNBlock(64, 128, 5, 1, dropout=dropouts[1], weight_decay=weight_decay)
         self.acc_dim, self.rot_dim = 21, 24
         self.imu_block11 = ResidualSECNNBlock(self.acc_dim, 64, 3, 1, dropout=dropouts[0])
         self.imu_block12 = ResidualSECNNBlock(64, 128, 5, 1, dropout=dropouts[1])
@@ -228,20 +214,13 @@ class TwoBranchModel(nn.Module):
         self.imu_block22 = ResidualSECNNBlock(64, 128, 5, 1, dropout=dropouts[1])
         
         # TOF/Thermal lighter branch
-        # v1
-        # self.tof_conv1 = nn.Conv1d(tof_dim, 64, 3, padding=1, bias=False)
-        # self.tof_bn1 = nn.BatchNorm1d(64)
-        # self.tof_drop1 = nn.Dropout(dropouts[2])
+        self.tof_conv1 = nn.Conv1d(tof_dim, 64, 3, padding=1, bias=False)
+        self.tof_bn1 = nn.BatchNorm1d(64)
+        self.tof_drop1 = nn.Dropout(dropouts[2])
         
-        # self.tof_conv2 = nn.Conv1d(64, 128, 3, padding=1, bias=False)
-        # self.tof_bn2 = nn.BatchNorm1d(128)
-        # self.tof_drop2 = nn.Dropout(dropouts[3])
-
-        # v2
-        self.tof_conv1 = ResidualSECNNBlock(tof_dim, 64, 3, 1, dropout=dropouts[2])
-        self.tof_conv2 = ResidualSECNNBlock(64, 128, 3, 1, dropout=dropouts[3])
-
-    
+        self.tof_conv2 = nn.Conv1d(64, 128, 3, padding=1, bias=False)
+        self.tof_bn2 = nn.BatchNorm1d(128)
+        self.tof_drop2 = nn.Dropout(dropouts[3])
 
         # Gate
         self.pool = nn.AdaptiveAvgPool1d(1)
@@ -249,26 +228,34 @@ class TwoBranchModel(nn.Module):
         self.dense2_gate = nn.Linear(16, 1)
         
 
-        merged_channels = 256 + 128
+        merged_channels = 256+ 128
         self.cnn_backbone1 = nn.Sequential(
             nn.Conv1d(merged_channels, 256, kernel_size=7, padding=3, bias=False),
             nn.BatchNorm1d(256),
-            nn.SiLU(),
+            nn.LeakyReLU(),
             nn.Dropout(dropouts[4])
         )
         self.cnn_backbone2 = nn.Sequential(
             nn.Conv1d(256, 512, kernel_size=5, padding=2, bias=False),
             nn.BatchNorm1d(512),
-            nn.SiLU(),
+            nn.LeakyReLU(),
             nn.Dropout(dropouts[5])
         )
-
         
-
-        # self.global_pool = AttentionLayer(512)
-        self.global_pool = nn.AdaptiveAvgPool1d(1)  
-
-
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.lstm_backbone1 = nn.LSTM(
+            input_size=512,
+            hidden_size=256,
+            num_layers=1,  
+            batch_first=True,
+            bidirectional=True
+        )
+        self.lstm_layer_norm1 = nn.LayerNorm(256)  
+        self.lstm_leaky_relu1 = nn.LeakyReLU()
+        self.lstm_dropout1 = nn.Dropout(dropouts[4])
+        
+        self.attn_fc_lstm2 = nn.Linear(512, 1) 
+        
         cnn_out_dim = 512
         self.dense1 = nn.Linear(cnn_out_dim, 256, bias=False)
         self.bn_dense1 = nn.BatchNorm1d(256)
@@ -285,67 +272,74 @@ class TwoBranchModel(nn.Module):
         imu = x[:, :, :self.fir_nchan].transpose(1, 2)  # (B, D_imu_raw, T)
         tof = x[:, :, self.fir_nchan:].transpose(1, 2)  # (B, D_tof, T)
 
-        imu  = self.imu_fe(imu)  # (B, D_imu, T)
+        imu = self.imu_fe(imu)  # (B, D_imu, T)
         
-        
-
-        acc = imu[:, :self.acc_dim, :]  
+        # IMU 分支
+        # x1 = self.imu_block1(imu) # (B, 64, T)
+        # x1 = self.imu_block2(x1) # (B, 128, T)
+        acc = imu[:, :self.acc_dim, :]  # 保留前21个通道作为加速度特征
         rot = imu[:, self.acc_dim:, :]  
         x11 = self.imu_block11(acc) # (B, 64, T)
-        x11 = self.imu_block12(x11) # (B, 128, T)
+        x11 = self.imu_block12(x11) # (B, 64, T)
         
         x12 = self.imu_block21(rot) # (B, 64, T)
-        x12 = self.imu_block22(x12) # (B, 128, T)
+        x12 = self.imu_block22(x12) # (B, 64, T)
         x1 = torch.cat([x11, x12], dim=1)
-
         
-        # TOF
-        
-        # v2
-        x2 = self.tof_conv1(tof)
-        x2 = self.tof_conv2(x2)
+        # TOF 分支
+        x2 = F.leaky_relu(self.tof_bn1(self.tof_conv1(tof)))
+        x2 = self.tof_drop1(x2) # (B, 64, T)
+        x2 = F.leaky_relu(self.tof_bn2(self.tof_conv2(x2)))
+        x2 = self.tof_drop2(x2) # (B, 128, T)
 
         # Gate x2
         gate_input = self.pool(tof.transpose(1, 2)).squeeze(-1)
-        gate_input = F.silu(self.dense1_gate(gate_input))
+        gate_input = F.relu(self.dense1_gate(gate_input))
     
         gate = torch.sigmoid(self.dense2_gate(gate_input)) # -> (B, 1)
         x2 = x2 * gate.unsqueeze(-1)
         
+
         merged = torch.cat([x1, x2], dim=1) # (B, 256, T)
-        
 
-        cnn_out = self.cnn_backbone1(merged) # (B, 256, T)
-        cnn_out = self.cnn_backbone2(cnn_out) # (B, 512, T)
+        cnn_feat = self.cnn_backbone1(merged) # (B, 256, T)
+        cnn_feat = self.cnn_backbone2(cnn_feat) # (B, 512, T)
+        # cnn_out_final = self.global_pool(cnn_feat).squeeze(-1)  # (B, 512, T) -> (B, 512, 1) -> (B, 512)
+        
+        # lstm_feat = merged.permute(0, 2, 1)  # (B, T, 256)
+        lstm_feat = cnn_feat.permute(0, 2, 1)
+        lstm_out, _ = self.lstm_backbone1(lstm_feat)  # (B, T, 512)
+    
+        # GRU注意力机制
+        attn_scores_lstm = torch.softmax(self.attn_fc_lstm2(lstm_out), dim=1)  # (B, T, 1)
+        lstm_out_final = torch.sum(attn_scores_lstm * lstm_out, dim=1)
 
+        # Element-wise fusion（必须维度一致）
+        pooled_flat = lstm_out_final
         
-        pooled = self.global_pool(cnn_out) # (B, 512, 1)
-        pooled_flat = torch.flatten(pooled, 1) # (B, 512)
-        # pooled_flat = self.global_pool(cnn_out.transpose(1, 2))
+        # pooled_flat = torch.sum(attn_scores * lstm_out, dim=1) 
+        # pooled = self.global_pool(cnn_out) # (B, 512, 1)
+        # pooled_flat = torch.flatten(pooled, 1) # (B, 512)
         
-        x = F.silu(self.bn_dense1(self.dense1(pooled_flat)))
+        x = F.leaky_relu(self.bn_dense1(self.dense1(pooled_flat)))
         x = self.drop1(x)
-        x = F.silu(self.bn_dense2(self.dense2(x)))
+        x = F.leaky_relu(self.bn_dense2(self.dense2(x)))
         x = self.drop2(x)
         
         logits = self.classifier(x)
-        return logits, x, gate
+        return logits, x,gate
 
-# %%
-debug_model = TwoBranchModel(
+debug_model = FuseGate(
     pad_len=100,
-    imu_dim_raw=14,
-    tof_dim=25,
-    n_classes=18,
+    imu_dim_raw=32,  
+    tof_dim=78,     
+    n_classes=18,   
 ).to(device)
 
-debug_x = torch.randn(4, 100, 14+25).to(device)  # (batch_size, channels, seq_len)
+debug_x = torch.randn(4, 100, 32+78).to(device)  # (batch_size, channels, seq_len)
 debug_model(debug_x)[0].shape
 
-# %% [markdown]
-# # Data Handling
 
-# %%
 def remove_gravity_from_acc(acc_data, rot_data):
 
     if isinstance(acc_data, pd.DataFrame):
@@ -449,7 +443,6 @@ def calculate_angular_distance(rot_data):
             
     return angular_dist
 
-# %%
 class SignalTransform:
     def __init__(self, always_apply: bool = False, p: float = 0.5):
         self.always_apply = always_apply
@@ -524,7 +517,6 @@ class TimeShift(SignalTransform):
 
         return augmented
 
-# %%
 # ================================
 # Data Handling
 # ================================
@@ -762,10 +754,373 @@ def augment_left_handed_sequence(seq_df: pd.DataFrame) -> pd.DataFrame:
 
 set_seed(3407)
 
-# %% [markdown]
-# # Training
+def calculate_tof_optical_flow(df):
+    flow_features_list = []
+    for _, group in df.groupby('sequence_id'):
+        flow_features = pd.DataFrame(index=group.index)
+        
+        # 只选择关键传感器 (1, 3, 5) - 减少传感器数量
+        for i in [1, 3, 5]:
+            cols = [f'tof_{i}_v{j}' for j in range(64)]
+            images = group[cols].values.reshape(-1, 8, 8)
+            
+            # 计算相邻帧差（简化光流）
+            if len(images) > 1:
+                flow = np.diff(images, axis=0)
+                flow = np.pad(flow, ((0,1), (0,0), (0,0)), mode='constant')
+            else:
+                flow = np.zeros_like(images)
+            
+            # 提取关键光流特征
+            flow_features[f'tof_{i}_flow_mean'] = flow.mean(axis=(1,2))
+            flow_features[f'tof_{i}_motion_energy'] = (flow**2).mean(axis=(1,2))
+        
+        # 跨传感器统计特征 (4个)
+        sensor_flows = [f'tof_{i}_flow_mean' for i in [1, 3, 5]]
+        flow_features['tof_flow_mean_all'] = flow_features[sensor_flows].mean(axis=1)
+        flow_features['tof_flow_std_all'] = flow_features[sensor_flows].std(axis=1)
+        flow_features['tof_motion_max'] = flow_features[[f'tof_{i}_motion_energy' for i in [1, 3, 5]]].max(axis=1)
+        flow_features['tof_motion_sum'] = flow_features[[f'tof_{i}_motion_energy' for i in [1, 3, 5]]].sum(axis=1)
+        
+        flow_features_list.append(flow_features)
+    return pd.concat(flow_features_list)
 
-# %%
+def calculate_tof_3d_features(df):
+    geometric_features_list = []
+    
+    for _, group in df.groupby('sequence_id'):
+        geometric_features = pd.DataFrame(index=group.index)
+        
+        # 只选择关键传感器 (2, 4) - 减少传感器数量
+        for i in [2, 4]:
+            cols = [f'tof_{i}_v{j}' for j in range(64)]
+            depths = group[cols].values
+            
+            # 核心几何特征
+            geometric_features[f'tof_{i}_depth_mean'] = depths.mean(axis=1)
+            geometric_features[f'tof_{i}_depth_std'] = depths.std(axis=1)
+            geometric_features[f'tof_{i}_depth_range'] = depths.max(axis=1) - depths.min(axis=1)
+            
+            # 表面粗糙度特征
+            curvature = []
+            for depth_map in depths:
+                depth_map = depth_map.reshape(8, 8)
+                # 简化的表面变化度量
+                grad_x = np.gradient(depth_map, axis=1)
+                grad_y = np.gradient(depth_map, axis=0)
+                surface_variation = np.sqrt(grad_x**2 + grad_y**2).mean()
+                curvature.append(surface_variation)
+            geometric_features[f'tof_{i}_surface_roughness'] = curvature
+        
+        # 跨传感器组合特征 (2个)
+        geometric_features['tof_depth_mean_diff'] = (
+            geometric_features['tof_2_depth_mean'] - geometric_features['tof_4_depth_mean']
+        )
+        geometric_features['tof_depth_std_sum'] = (
+            geometric_features['tof_2_depth_std'] + geometric_features['tof_4_depth_std']
+        )
+        
+        geometric_features_list.append(geometric_features)
+    return pd.concat(geometric_features_list)
+
+CENTER_XY = 3.5
+y_coords, x_coords = np.mgrid[0:8, 0:8]
+def calculate_tof_centroid_dist(row: pd.Series) -> float:
+    """
+    计算单行数据（一个时间点）的tof_centroid_dist
+    """
+    all_centroids = []
+    all_energies = []
+
+    # 第A步：为5个传感器分别计算质心
+    for i in range(1, 6):
+        # 提取、处理、重塑
+        tof_cols = [f'tof_{i}_v{j}' for j in range(64)]
+        pixel_values = row[tof_cols].values.astype(float)
+        pixel_values[pixel_values == -1] = 0
+        grid = pixel_values.reshape(8, 8)
+        
+        total_energy = np.sum(grid)
+
+        if total_energy < 1e-6: # 如果没有信号
+            cx, cy = CENTER_XY, CENTER_XY
+        else:
+            # 计算质心
+            cx = np.sum(x_coords * grid) / total_energy
+            cy = np.sum(y_coords * grid) / total_energy
+        
+        all_centroids.append([cx, cy])
+        all_energies.append(total_energy)
+
+    # 第B步：计算总体质心（加权平均）
+    all_centroids = np.array(all_centroids)
+    all_energies = np.array(all_energies)
+    total_system_energy = np.sum(all_energies)
+
+    if total_system_energy < 1e-6:
+        overall_cx, overall_cy = CENTER_XY, CENTER_XY
+    else:
+        overall_cx = np.sum(all_centroids[:, 0] * all_energies) / total_system_energy
+        overall_cy = np.sum(all_centroids[:, 1] * all_energies) / total_system_energy
+
+    # 第C步：计算到中心的距离
+    dist = np.sqrt((overall_cx - CENTER_XY)**2 + (overall_cy - CENTER_XY)**2)
+    
+    return dist
+
+def compute_global_acceleration_final(df, chunk_size=1000):
+    df['acc_global_x'] = np.nan
+    df['acc_global_y'] = np.nan
+    df['acc_global_z'] = np.nan
+    # 分块处理
+    for i in range(0, len(df), chunk_size):
+        chunk = df.iloc[i:i+chunk_size].copy()
+        
+        # 1. 提取数据并检查NaN
+        acc_local = chunk[['acc_x', 'acc_y', 'acc_z']].values
+        quat = chunk[['rot_w', 'rot_x', 'rot_y', 'rot_z']].values
+        
+        # 2. 处理NaN值
+        nan_mask = np.isnan(quat).any(axis=1)
+        if np.any(nan_mask):
+            # 用默认单位四元数替换NaN
+            quat[nan_mask] = [1.0, 0.0, 0.0, 0.0]
+        
+        # 3. 处理零模四元数
+        norms = np.linalg.norm(quat, axis=1)
+        zero_mask = norms < 1e-10
+        if np.any(zero_mask):
+            quat[zero_mask] = [1.0, 0.0, 0.0, 0.0]
+        
+        # 4. 归一化四元数
+        norms = np.linalg.norm(quat, axis=1, keepdims=True)
+        safe_quat = quat / norms
+        
+        # 5. 转换为旋转矩阵
+        quat_adjusted = np.roll(safe_quat, shift=-1, axis=-1)
+        rotations = R.from_quat(quat_adjusted)
+        rotation_matrices = rotations.as_matrix()  
+        # 6. 计算全局加速度
+        acc_global = np.einsum('tij,tj->ti', rotation_matrices, acc_local)
+        # 7. 存储结果
+        df.iloc[i:i+chunk_size, df.columns.get_loc('acc_global_x')] = acc_global[:, 0]
+        df.iloc[i:i+chunk_size, df.columns.get_loc('acc_global_y')] = acc_global[:, 1]
+        df.iloc[i:i+chunk_size, df.columns.get_loc('acc_global_z')] = acc_global[:, 2]
+    return df
+
+def bin_imu_features_for_bfrb(df):
+    binned_features = pd.DataFrame(index=df.index)
+    
+    # 1. 动作强度分箱（BFRB通常更用力）
+    accel_mag = np.sqrt(df['linear_acc_x']**2 + df['linear_acc_y']**2 + df['linear_acc_z']**2)
+    # 根据文献：BFRB行为强度通常更高
+    binned_features['accel_intensity'] = pd.cut(accel_mag, 
+                                               bins=[0, 0.5, 2.0, 5.0, np.inf],
+                                               labels=[0, 1, 2, 3])  # 0=静止, 3=剧烈
+    
+
+    if 'angvel_mag' in df.columns:
+        binned_features['rotation_intensity'] = pd.cut(df['angvel_mag'],
+                                                      bins=[0, 0.1, 0.5, 1.5, np.inf],
+                                                      labels=[0, 1, 2, 3])
+    
+
+    ax, ay, az = df['linear_acc_x'], df['linear_acc_y'], df['linear_acc_z']
+    # 简化为主要运动方向
+    directions = []
+    for i in range(len(df)):
+        x, y, z = abs(ax.iloc[i]), abs(ay.iloc[i]), abs(az.iloc[i])
+        if max(x, y, z) == x:
+            directions.append(0)  # X方向主导
+        elif max(x, y, z) == y:
+            directions.append(1)  # Y方向主导
+        else:
+            directions.append(2)  # Z方向主导
+    binned_features['motion_direction'] = directions
+    
+    return binned_features
+
+def calculate_attitude_angles(quat_data):
+    """
+    从四元数计算姿态角（roll, pitch, yaw）
+    
+    参数:
+        quat_data (np.ndarray): 四元数数组，形状为 (N, 4)，列顺序为 [rot_x, rot_y, rot_z, rot_w]
+                               注意：这里假设输入顺序是x,y,z,w，需根据实际数据调整
+    
+    返回:
+        np.ndarray: 姿态角数组，形状为 (N, 3)，列顺序为 [roll, pitch, yaw]（单位：弧度）
+    """
+    # 确保输入是numpy数组
+    quat_data = np.array(quat_data)
+    
+    # 调整四元数顺序为 [w, x, y, z]（标准四元数表示）
+    # 注意：如果输入顺序是 [rot_x, rot_y, rot_z, rot_w]，则需重新排序
+    w = quat_data[:, 3]  # rot_w
+    x = quat_data[:, 0]  # rot_x
+    y = quat_data[:, 1]  # rot_y
+    z = quat_data[:, 2]  # rot_z
+    
+    # 计算roll (绕x轴旋转)
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x**2 + y**2)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+    
+    # 计算pitch (绕y轴旋转)
+    sinp = 2 * (w * y - z * x)
+    # 处理万向锁情况（sinp接近±1）
+    pitch = np.where(np.abs(sinp) >= 1, 
+                    np.sign(sinp) * np.pi / 2,  # 限制在±90度
+                    np.arcsin(sinp))
+    
+    # 计算yaw (绕z轴旋转)
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y**2 + z**2)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+    
+    # 返回结果，形状为 (N, 3)
+    return np.column_stack([roll, pitch, yaw])
+
+def compute_physics_features(df):
+    """计算去除重力后的线性加速度和姿态角，并只返回姿态角特征（roll, pitch, yaw）"""
+    # 初始化存储姿态角的DataFrame
+    attitude_angles_df = pd.DataFrame(index=df.index)  # 索引与原df一致
+
+    # 按sequence_id分组计算姿态角
+    for _, group in df.groupby('sequence_id'):
+        
+        # 计算姿态角
+        quat_data = group[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+        attitude_angles = calculate_attitude_angles(quat_data)  # 返回 (N, 3) 数组
+        
+        # 将姿态角存入DataFrame（注意索引对齐）
+        attitude_angles_df.loc[group.index, 'roll'] = attitude_angles[:, 0]    # 弧度
+        attitude_angles_df.loc[group.index, 'pitch'] = attitude_angles[:, 1]   # 弧度
+        attitude_angles_df.loc[group.index, 'yaw'] = attitude_angles[:, 2]     # 弧度
+
+    # 返回仅包含姿态角的DataFrame（不计算linear_acc）
+    return attitude_angles_df
+
+def bin_tof_features_for_bfrb(df):
+    """
+    基于BFRB行为特点的TOF特征分箱
+    包含所需特征的计算和分箱
+    """
+    binned_features = pd.DataFrame(index=df.index)
+    
+    # 先计算所需的TOF特征
+    print("计算TOF必需特征...")
+    tof_required_features = calculate_tof_required_features(df)
+    
+    # 将计算的特征合并到当前DataFrame中（仅用于本次分箱计算）
+    df_with_features = pd.concat([df, tof_required_features], axis=1)
+    
+    # 1. 距离检测分箱（BFRB涉及特定身体部位接触）
+    for i in [1, 2, 3, 4, 5]:  # 所有5个传感器
+        feature_name = f'tof_{i}_depth_mean'
+        if feature_name in df_with_features.columns:
+            depth_data = df_with_features[feature_name]
+            # 根据文献：BFRB通常涉及皮肤接触(很近距离)
+            # 0-50mm: 皮肤接触, 50-100mm: 手部接近, 100-200mm: 中等距离, 200mm+: 远距离
+            bins = [0, 50, 100, 200, np.inf]
+            labels = [0, 1, 2, 3]  # 0=皮肤接触, 3=远距离
+            binned_features[f'tof_{i}_distance_level'] = pd.cut(depth_data,
+                                                               bins=bins,
+                                                               labels=labels,
+                                                               right=False)
+
+    # 2. 表面粗糙度分箱（皮肤vs其他表面）
+    for i in [2, 4]:  # 选择关键传感器（可根据实际效果调整）
+        feature_name = f'tof_{i}_surface_roughness'
+        if feature_name in df_with_features.columns:
+            roughness_data = df_with_features[feature_name]
+            # 根据文献：皮肤表面有特定的纹理模式
+            # 0-0.01: 极光滑表面, 0.01-0.05: 皮肤纹理, 0.05-0.1: 粗糙表面, 0.1+: 很粗糙
+            bins = [0, 0.01, 0.05, 0.1, np.inf]
+            labels = [0, 1, 2, 3]  # 1=皮肤纹理特征
+            binned_features[f'tof_{i}_surface_level'] = pd.cut(roughness_data,
+                                                              bins=bins,
+                                                              labels=labels,
+                                                              right=False)
+
+    # 3. 运动模式分箱（BFRB有特定的重复运动模式）
+    if 'tof_motion_max' in df_with_features.columns:
+        motion_data = df_with_features['tof_motion_max']
+        # 根据文献：BFRB行为通常有特定的重复性运动模式
+        # 0-0.1: 几乎无运动, 0.1-0.5: 轻微运动, 0.5-1.0: 中等运动, 1.0+: 剧烈运动
+        bins = [0, 0.1, 0.5, 1.0, np.inf]
+        labels = [0, 1, 2, 3]  # 2-3=可能的BFRB运动强度
+        binned_features['tof_motion_intensity'] = pd.cut(motion_data,
+                                                        bins=bins,
+                                                        labels=labels,
+                                                        right=False)
+    
+    return binned_features
+
+def calculate_tof_required_features(df):
+    """
+    计算TOF分箱所需的特征
+    """
+    required_features_list = []
+    
+    for _, group in df.groupby('sequence_id'):
+        required_features = pd.DataFrame(index=group.index)
+        
+        # 1. 计算每个传感器的深度均值
+        for i in range(1, 6):  # 5个传感器
+            cols = [f'tof_{i}_v{j}' for j in range(64)]
+            if all(col in group.columns for col in cols):
+                depths = group[cols].values
+                required_features[f'tof_{i}_depth_mean'] = depths.mean(axis=1)
+        
+        # 2. 计算表面粗糙度
+        for i in range(1, 6):
+            cols = [f'tof_{i}_v{j}' for j in range(64)]
+            if all(col in group.columns for col in cols):
+                depths = group[cols].values
+                
+                roughness_values = []
+                for depth_map in depths:
+                    depth_map = depth_map.reshape(8, 8)
+                    # 计算梯度幅值作为粗糙度（Sobel梯度更合适，这里用numpy简化）
+                    grad_x = np.gradient(depth_map, axis=1)
+                    grad_y = np.gradient(depth_map, axis=0)
+                    # 根据文献，皮肤表面有特定的微观纹理
+                    roughness = np.sqrt(grad_x**2 + grad_y**2).mean()
+                    roughness_values.append(roughness)
+                
+                required_features[f'tof_{i}_surface_roughness'] = roughness_values
+        
+        # 3. 计算最大运动强度（基于光流）
+        all_motion_energy = []
+        sensor_motion_features = {}
+        
+        for i in range(1, 6):
+            cols = [f'tof_{i}_v{j}' for j in range(64)]
+            if all(col in group.columns for col in cols):
+                images = group[cols].values.reshape(-1, 8, 8)
+                
+                if len(images) > 1:
+                    # 计算帧间差分（简化光流）
+                    flow = np.diff(images, axis=0)
+                    flow = np.pad(flow, ((0,1), (0,0), (0,0)), mode='constant')
+                else:
+                    flow = np.zeros_like(images)
+                
+                # 计算运动能量
+                motion_energy = (flow**2).mean(axis=(1,2))
+                sensor_motion_features[f'tof_{i}_motion_energy'] = motion_energy
+                all_motion_energy.append(motion_energy)
+        
+        # 取所有传感器中的最大值作为整体运动强度
+        if all_motion_energy:
+            required_features['tof_motion_max'] = np.max(np.array(all_motion_energy), axis=0)
+        
+        required_features_list.append(required_features)
+    
+    return pd.concat(required_features_list)
+
+
 def mixup_collate_fn(batch, alpha, imu_dim, masking_prob=0.0):
     X_batch = torch.stack([item[0] for item in batch])
     y_batch = torch.stack([item[1] for item in batch])
@@ -806,10 +1161,13 @@ def mixup_collate_fn(batch, alpha, imu_dim, masking_prob=0.0):
 
     return X_batch, y_batch, gate_target
 
-# %%
+# ================================
+# Training Pipeline
+# ================================
 if TRAIN:
     print("▶ TRAIN MODE – loading dataset …")
     df = pd.read_csv(RAW_DIR / "train.csv")
+
     df_demo = (pd.read_csv(RAW_DIR / "train_demographics.csv"))[['subject', 'handedness']]
     df = df.merge(df_demo, on='subject', how='left')
 
@@ -820,44 +1178,30 @@ if TRAIN:
 
 
     # Label encoding
-    seq_gp = df.groupby('sequence_id')
-    df_seq_id = pd.DataFrame()
-    for seq_id, seq in tqdm(seq_gp):
-        orientation = seq['orientation'].iloc[0]
-        gesture = seq['gesture'].iloc[0]
-        initial_behaviors = seq['behavior'].iloc[0]
-        subject = seq['subject'].iloc[0]
-
-        temp_df = pd.DataFrame({
-            'seq_id': seq_id,
-            'orientation': orientation,
-            'gesture': gesture,
-            'initial_behavior': initial_behaviors,
-            'subject': subject
-        }, index=[0])
-        df_seq_id = pd.concat([df_seq_id, temp_df], ignore_index=True)
-    df_seq_id['label'] = df_seq_id['orientation'] + '_' + df_seq_id['gesture'] + '_' + df_seq_id['initial_behavior']
-    print(df_seq_id)
-    print("unique behavior",df_seq_id['initial_behavior'].nunique())
-    print("unique orientation",df_seq_id['orientation'].nunique())
-    num_unique_labels = df_seq_id['label'].nunique()
-    print(f"Number of unique labels: {num_unique_labels}")
-    
     le = LabelEncoder()
-    label_array = le.fit_transform(df_seq_id['label'])
+    df['gesture_int'] = le.fit_transform(df['gesture'])
     np.save(EXPORT_DIR / "gesture_classes.npy", le.classes_)
 
-    # le = LabelEncoder()
-    # df['gesture_int'] = le.fit_transform(df['gesture'])
-    # np.save(EXPORT_DIR / "gesture_classes.npy", le.classes_)
-    
-
     # Feature list
-    meta_cols = {'gesture', 'gesture_int', 'sequence_type', 'behavior', 'orientation',
+    meta_cols = {'gesture', 'gesture_int', 'sequence_type', 'behavior', 'orientation', 
                  'row_id', 'subject', 'phase', 'sequence_id', 'sequence_counter', 'handedness'}
     feature_cols_meta = [c for c in df.columns if c not in meta_cols]
-
-
+    print("bin_tof_features_for_bfrb")
+    binned_tof_features = bin_tof_features_for_bfrb(df)
+    df = pd.concat([df, binned_tof_features], axis=1)
+    print("calculate_tof_optical_flow")
+    df_tof_flow=calculate_tof_optical_flow(df)
+    df = pd.concat([df, df_tof_flow], axis=1)
+    print("calculate_tof_3d_features")  
+    df_tof_3d = calculate_tof_3d_features(df)
+    df = pd.concat([df, df_tof_3d], axis=1)
+    del df_tof_flow,df_tof_3d
+    
+    print("compute_physics_features")
+    attitude_angles = compute_physics_features(df)
+    df = df.merge(attitude_angles, left_index=True, right_index=True, how='left')
+    print("add_rotated_acceleration_to_df")
+    df = compute_global_acceleration_final(df, chunk_size=50000)
     print("  Removing gravity and calculating linear acceleration features...")
 
     linear_accel_list = []
@@ -867,7 +1211,7 @@ if TRAIN:
         linear_accel_group = remove_gravity_from_acc(acc_data_group, rot_data_group)
         linear_accel_list.append(pd.DataFrame(linear_accel_group, columns=['linear_acc_x', 'linear_acc_y', 'linear_acc_z'], index=group.index))
     df_linear_accel = pd.concat(linear_accel_list)
-
+    # df_linear_accel = pd.read_parquet("./ver40/right/df_linear_accel.parquet")
     df = pd.concat([df, df_linear_accel], axis=1)
 
     print("  Calculating angular velocity from quaternion derivatives...")
@@ -877,48 +1221,111 @@ if TRAIN:
         angular_vel_group = calculate_angular_velocity_from_quat(rot_data_group)
         angular_vel_list.append(pd.DataFrame(angular_vel_group, columns=['angular_vel_x', 'angular_vel_y', 'angular_vel_z'], index=group.index))
     df_angular_vel = pd.concat(angular_vel_list)
-   
-
     df = pd.concat([df, df_angular_vel], axis=1)
-
+    df['angvel_mag'] = np.sqrt(df['angular_vel_x']**2 + df['angular_vel_y']**2 + df['angular_vel_z']**2)
     print("  Calculating angular distance between successive quaternions...")
     angular_distance_list = []
     for _, group in df.groupby('sequence_id'):
         rot_data_group = group[['rot_x', 'rot_y', 'rot_z', 'rot_w']]
         angular_dist_group = calculate_angular_distance(rot_data_group)
         angular_distance_list.append(pd.DataFrame(angular_dist_group, columns=['angular_distance'], index=group.index))
+
     df_angular_distance = pd.concat(angular_distance_list)
-    
-
     df = pd.concat([df, df_angular_distance], axis=1)
+    print("Applying IMU binning...")
+    imu_binned = bin_imu_features_for_bfrb(df)
+    df = pd.concat([df, imu_binned], axis=1)
+    del imu_binned,df_angular_distance,df_angular_vel
+    # 定义简化后的统计特征列名
+    imu_stat_col_simplified = ["acc_mean", "acc_max", "acc_std", "acc_min", "rot_mean", "rot_max", "rot_std", "rot_min"]
+    stat_features = {}
+    acc_grouped = df.groupby('sequence_id')[['acc_x', 'acc_y', 'acc_z']]
+    stat_features['acc_mean'] = acc_grouped.mean().mean(axis=1) 
+    stat_features['acc_max'] = acc_grouped.max().max(axis=1)    
+    stat_features['acc_std'] = acc_grouped.std().mean(axis=1)   
+    stat_features['acc_min'] = acc_grouped.min().min(axis=1)   
+    rot_grouped = df.groupby('sequence_id')[['rot_x', 'rot_y', 'rot_z', 'rot_w']]
+    stat_features['rot_mean'] = rot_grouped.mean().mean(axis=1) 
+    stat_features['rot_max'] = rot_grouped.max().max(axis=1)     
+    stat_features['rot_std'] = rot_grouped.std().mean(axis=1)  
+    stat_features['rot_min'] = rot_grouped.min().min(axis=1)   
 
-
+    stat_features_df = pd.DataFrame(stat_features)
+    stat_features_df = stat_features_df.reset_index()
+    df = df.merge(stat_features_df, on='sequence_id', how='left')
+    
     imu_cols_base = [c for c in feature_cols_meta if not (c.startswith('thm_') or c.startswith('tof_'))]
     imu_engineered_features = [
     'linear_acc_x', 'linear_acc_y', 'linear_acc_z',
-    'angular_vel_x', 'angular_vel_y', 'angular_vel_z', 'angular_distance',
+    'angular_vel_x', 'angular_vel_y', 'angular_vel_z',
+    'angular_distance','acc_global_x','acc_global_y','acc_global_z','angvel_mag'
     ]
-    imu_cols = imu_cols_base + imu_engineered_features
-
+    IMU_BINNED_FEATURES = [
+        'accel_intensity',
+        'rotation_intensity',
+        'motion_direction'
+    ]
+    imu_cols = imu_cols_base + imu_engineered_features+imu_stat_col_simplified+['roll','pitch','yaw']+IMU_BINNED_FEATURES
 
     thm_cols_original = [c for c in df.columns if c.startswith('thm_')]
     tof_aggregated_cols_template = []
-    stat_types = ['mean', 'std', 'min', 'max']
+    stat_types = ['mean', 'std', 'min', 'max', 'range', 'iqr', 'skew', 'kurtosis', 'mad']
+    
     for i in range(1, 6):
         tof_aggregated_cols_template.extend([f'tof_{i}_{stat}' for stat in stat_types])
-    # for i in range(1, 6):
-    #     tof_aggregated_cols_template.extend([f'tof_{i}_v{p}' for p in range(64)])
+    
 
-    tof_cols = thm_cols_original + tof_aggregated_cols_template
-    feature_cols = imu_cols + tof_cols
+    print("  Calculating TOF/THM aggregated features...")
+    df_tof_aggregated = pd.read_parquet("./ver40/right/tof_agg_replace1.parquet")
+    df = pd.concat([df, df_tof_aggregated], axis=1)
+
+
+    # tof_cols = thm_cols_original + tof_aggregated_cols_template
+    # feature_cols = imu_cols + thm_cols_original + tof_aggregated_cols_template
+    # 新增的 THM 特征列（差分、传感器间差异、趋势）
+    TOF_FLOW_FEATURES = [
+        'tof_1_flow_mean',
+        'tof_1_motion_energy',
+        'tof_3_flow_mean', 
+        'tof_3_motion_energy',
+        'tof_5_flow_mean',
+        'tof_5_motion_energy',
+        'tof_flow_mean_all',
+        'tof_flow_std_all',
+        'tof_motion_max',
+        'tof_motion_sum'
+    ]
+    TOF_3D_FEATURES = [
+        'tof_2_depth_mean',
+        'tof_2_depth_std',
+        'tof_2_depth_range',
+        'tof_2_surface_roughness',
+        'tof_4_depth_mean',
+        'tof_4_depth_std',
+        'tof_4_depth_range',
+        'tof_4_surface_roughness',
+        'tof_depth_mean_diff',
+        'tof_depth_std_sum'
+    ]
+    TOF_ADVANCED_FEATURES = TOF_FLOW_FEATURES + TOF_3D_FEATURES
+    TOF_BINNED_FEATURES = [
+        'tof_1_distance_level','tof_2_distance_level','tof_3_distance_level', 
+        'tof_4_distance_level','tof_5_distance_level',
+        'tof_2_surface_level','tof_4_surface_level','tof_motion_intensity'
+    ]
+    # tof_cols = tof_aggregated_cols_template + tof_grid_cols + tof_diff_cols +thm_cols
+    tof_cols = tof_aggregated_cols_template+thm_cols_original+TOF_ADVANCED_FEATURES+TOF_BINNED_FEATURES
+    feature_cols = imu_cols +tof_cols
+
     print(f"  IMU {len(imu_cols)} | TOF/THM {len(tof_cols)} | total {len(feature_cols)} features")
 
     
     # Build sequences
+    # df= enhance_thm_tof_features(df)
     seq_gp = df.groupby('sequence_id')
     all_steps_for_scaler_list = []
-    X_list, y_list, id_list, hand_list, lens = [], [], [], [],[]
-    for idx, (seq_id, seq) in tqdm(enumerate(seq_gp)):
+    X_list, y_list, id_list, lens = [], [], [], []
+    for seq_id, seq in tqdm(seq_gp):
         seq_df = seq.copy()
         for i in range(1, 6):
             pixel_cols_tof = [f"tof_{i}_v{p}" for p in range(64)]
@@ -927,14 +1334,16 @@ if TRAIN:
             seq_df[f'tof_{i}_std']  = tof_sensor_data.std(axis=1)
             seq_df[f'tof_{i}_min']  = tof_sensor_data.min(axis=1)
             seq_df[f'tof_{i}_max']  = tof_sensor_data.max(axis=1)
-           
+            seq_df[f'tof_{i}_range'] = tof_sensor_data.max(axis=1) - tof_sensor_data.min(axis=1)
+            seq_df[f'tof_{i}_iqr'] = tof_sensor_data.quantile(0.75, axis=1) - tof_sensor_data.quantile(0.25, axis=1)
+            seq_df[f'tof_{i}_skew'] = tof_sensor_data.skew(axis=1)
+            seq_df[f'tof_{i}_kurtosis'] = tof_sensor_data.kurtosis(axis=1)
+            seq_df[f'tof_{i}_mad'] = tof_sensor_data.sub(tof_sensor_data.mean(axis=1), axis=0).abs().mean(axis=1)
 
         mat = seq_df[feature_cols].ffill().bfill().fillna(0).values.astype('float32')
         all_steps_for_scaler_list.append(mat)
         X_list.append(mat)
-        # y_list.append(seq['gesture_int'].iloc[0].astype(np.int32))
-        y_list.append(label_array[idx])
-        hand_list.append(seq['handedness'].iloc[0])
+        y_list.append(seq['gesture_int'].iloc[0])
         id_list.append(seq_id)
         lens.append(len(mat))
 
@@ -953,9 +1362,9 @@ if TRAIN:
     np.save(EXPORT_DIR / "sequence_maxlen.npy", pad_len)
     np.save(EXPORT_DIR / "feature_cols.npy", np.array(feature_cols))
     id_list = np.array(id_list)
-    hand_list = np.array(hand_list)
     X_list_all = pad_sequences_torch(X_list, maxlen=pad_len, padding='pre', truncating='pre')
     y_list_all = np.eye(len(le.classes_))[y_list].astype(np.float32)  # One-hot encoding
+
 
     augmenter = Augment(
         p_jitter=0.9844818619033621, sigma=0.03291295776089293, scale_range=(0.7542342630597011,1.1625052821731077),
@@ -963,11 +1372,10 @@ if TRAIN:
         p_moda=0.3910622476959722, drift_std=0.0040285239353308015, drift_max=0.3929358950258158    
     )
 
-# %%
+
 metric_loss_fn = losses.TripletMarginLoss(margin=0.2) 
 miner = miners.TripletMarginMiner(margin=0.2, type_of_triplets="hard")
 
-# %%
 EPOCHS = 160
 
 
@@ -983,7 +1391,6 @@ collate_fn_with_args = partial(mixup_collate_fn,
                                )
 skf = StratifiedGroupKFold(n_splits=FOLDS, shuffle=True, random_state=42)
 for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_type'].first(), groups=groups_by_subject)):
-        
     best_h_f1 = 0
     train_list= X_list_all[train_idx]
     train_y_list= y_list_all[train_idx]
@@ -1003,7 +1410,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
 
 
     # Model
-    model = TwoBranchModel(maxlen, len(imu_cols), len(tof_cols), 
+    model = FuseGate(maxlen, len(imu_cols), len(tof_cols), 
                     len(le.classes_)).to(device)
     ema = ModelEMA(model, decay=0.99)
     # Optimizer and scheduler
@@ -1029,7 +1436,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
     i_scheduler = 0
     
     # Training loop
-    print("▶ Starting training...")
+    print(f"▶ Starting Fold {fold} training...")
     for epoch in range(EPOCHS):
         model.train()
         train_preds = []
@@ -1084,17 +1491,12 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
 
         oof[val_idx] = val_preds
 
-        train_pred_true = [x.split('_')[1] for x in le.classes_[train_preds]]
-        val_pred_true = [x.split('_')[1] for x in le.classes_[val_preds]]
-        train_targets_true = [x.split('_')[1] for x in le.classes_[train_targets]]
-        val_targets_true = [x.split('_')[1] for x in le.classes_[val_targets]]
-
         train_acc = CompetitionMetric().calculate_hierarchical_f1(
-            pd.DataFrame({'gesture': train_targets_true}),
-            pd.DataFrame({'gesture': train_pred_true}))
+            pd.DataFrame({'gesture': le.classes_[train_targets]}),
+            pd.DataFrame({'gesture': le.classes_[train_preds]}))
         val_acc = CompetitionMetric().calculate_hierarchical_f1(
-            pd.DataFrame({'gesture': val_targets_true}),
-            pd.DataFrame({'gesture': val_pred_true}))
+            pd.DataFrame({'gesture': le.classes_[val_targets]}),
+            pd.DataFrame({'gesture': le.classes_[val_preds]}))
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
 
@@ -1128,18 +1530,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
     print(f"fold: {fold} val_all_acc: {best_h_f1:.4f}")
     print("✔ Training done – artefacts saved in", EXPORT_DIR)
 
-# %%
-val_pred_true = le.classes_[val_preds.argmax(1)]
-val_pred_true = [x.split('_')[1] for x in val_pred_true]
-val_target_true = [x.split('_')[1] for x in le.classes_[val_targets]]
-
-# %%
-CompetitionMetric().calculate_hierarchical_f1(
-            pd.DataFrame({'gesture': val_target_true}),
-            pd.DataFrame({'gesture': val_pred_true}))
-
-# %%
-
 groups_by_subject = seq_gp['subject'].first()
 
 skf = StratifiedGroupKFold(n_splits=FOLDS, shuffle=True, random_state=42)
@@ -1158,7 +1548,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
     best_model_path = EXPORT_DIR/ f"gesture_two_branch_fold{fold}.pth"
     print(f"Evaluating fold {fold+1} with model {best_model_path}")
     
-    eval_model = TwoBranchModel(maxlen, len(imu_cols), len(tof_cols), 
+    eval_model = FuseGate(maxlen, len(imu_cols), len(tof_cols), 
                     len(le.classes_)).to(device)
     eval_model.load_state_dict(torch.load(best_model_path, map_location=device)['model_state_dict'])
     eval_model.to(device)
@@ -1187,49 +1577,53 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
     oof_imu[val_idx] = val_preds
     oof[val_idx] = val_preds2
 
-    val_pred_true = le.classes_[val_preds]
-    val_pred_true = [x.split('_')[1] for x in val_pred_true]
-
-    val_pred2_true = [x.split('_')[1] for x in le.classes_[val_preds2]]
-    val_target_true = [x.split('_')[1] for x in le.classes_[val_targets]]
-
     h_f1 = CompetitionMetric().calculate_hierarchical_f1(
-        pd.DataFrame({'gesture': val_target_true}),
-        pd.DataFrame({'gesture': val_pred_true})
+        pd.DataFrame({'gesture': le.classes_[val_targets]}),
+        pd.DataFrame({'gesture': le.classes_[val_preds]})
     )
 
     all_h_f1 = CompetitionMetric().calculate_hierarchical_f1(
-        pd.DataFrame({'gesture': val_target_true}),
-        pd.DataFrame({'gesture': val_pred2_true})
+        pd.DataFrame({'gesture': le.classes_[val_targets]}),
+        pd.DataFrame({'gesture': le.classes_[val_preds2]})
     )
 
     print(f"Fold {fold+1} H-F1 = {h_f1:.4f}")
     print(f"Fold {fold+1} All H-F1 = {all_h_f1:.4f}")
     print("\n")
 
-oof_imu_true = [x.split('_')[1] for x in le.classes_[oof_imu.astype(int)]]
-oof_true = [x.split('_')[1] for x in le.classes_[oof.astype(int)]]
-
-y_list_all_true = [x.split('_')[1] for x in le.classes_[y_list_all.argmax(axis=1)]]
 
 imu_h_f1 = CompetitionMetric().calculate_hierarchical_f1(
-    pd.DataFrame({'gesture': oof_imu_true}),
-    pd.DataFrame({'gesture': y_list_all_true})
+    pd.DataFrame({'gesture': le.classes_[oof_imu.astype(int)]}),
+    pd.DataFrame({'gesture': le.classes_[y_list_all.argmax(axis=1)]})
 )
 
 h_f1 = CompetitionMetric().calculate_hierarchical_f1(
-    pd.DataFrame({'gesture': oof_true}),
-    pd.DataFrame({'gesture': y_list_all_true})
+    pd.DataFrame({'gesture': le.classes_[oof.astype(int)]}),
+    pd.DataFrame({'gesture': le.classes_[y_list_all.argmax(axis=1)]})
 )
 
 print(f"OOF H-F1 = {h_f1:.4f}")
 print(f"OOF IMU H-F1 = {imu_h_f1:.4f}")
 
-# %%
+# Fold 5 ori
+
+# OOF H-F1 = 0.8758
+# OOF IMU H-F1 = 0.8491
+
+# 0.8624691571465476
+
+# Right Handed OOF H-F1 = 0.8802
+# Right Handed OOF IMU H-F1 = 0.8534
+# Right Handed OOF H-F1 + IMU H-F1 = 0.8668
+
+
+# Left Handed OOF H-F1 = 0.8463
+# Left Handed OOF IMU H-F1 = 0.8197
+# Left Handed OOF H-F1 + IMU H-F1 = 0.8330
+
 (imu_h_f1 + h_f1) / 2
 
-# %%
-trian_dem = pd.read_csv("/kaggle/input/cmi-detect-behavior-with-sensor-data/train_demographics.csv")
+trian_dem = pd.read_csv(RAW_DIR / "train_demographics.csv")
 subject_handedness = trian_dem.set_index('subject')['handedness'].to_dict()
 
 
@@ -1272,5 +1666,87 @@ print("\n")
 print(f"Left Handed OOF H-F1 = {left_h_f1:.4f}")
 print(f"Left Handed OOF IMU H-F1 = {left_imu_h_f1:.4f}")
 print(f"Left Handed OOF H-F1 + IMU H-F1 = {(left_h_f1 + left_imu_h_f1) / 2:.4f}")
+
+
+groups_by_subject = seq_gp['subject'].first()
+
+skf = StratifiedGroupKFold(n_splits=FOLDS, shuffle=True, random_state=42)
+
+oof = np.zeros((X_list_all.shape[0], 18), dtype=np.float32)
+oof_imu = np.zeros((X_list_all.shape[0], 18))
+for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_type'].first(), groups=groups_by_subject)):
+    _, val_list = X_list_all[train_idx], X_list_all[val_idx]
+    _, val_y_list = y_list_all[train_idx], y_list_all[val_idx]
+
+    val_dataset = CMI3Dataset(val_list, val_y_list, maxlen, mode="val")
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0,drop_last=False)
+    
+
+    # best_model_path = Path("/kaggle/input/cmi-clear-imu-only") / f"exp172_gesture_two_branch_fold{fold}.pth"
+    best_model_path = EXPORT_DIR/ f"gesture_two_branch_fold{fold}.pth"
+    print(f"Evaluating fold {fold+1} with model {best_model_path}")
+    
+    eval_model = FuseGate(maxlen, len(imu_cols), len(tof_cols), 
+                    len(le.classes_)).to(device)
+    eval_model.load_state_dict(torch.load(best_model_path, map_location=device)['model_state_dict'])
+    eval_model.to(device)
+    eval_model.eval()
+    with torch.inference_mode():
+        val_preds = []
+        val_targets = []
+        val_preds2 = []
+        for X, y in tqdm(val_loader, desc=f"[Val]"):
+            logits2 = eval_model(X.float().to(device))[0]
+            val_preds2.extend(logits2.cpu().numpy())
+        
+            half = BATCH_SIZE // 2         
+
+            x_front = X[:half].clone()                 
+            x_back  = X[half:].clone()      
+            
+            x_front[:, :, len(imu_cols):] = 0.0  
+            x_back[:, :, len(imu_cols):] = 0.0    
+            X = torch.cat([x_front, x_back], dim=0)  # (B, C, T)
+            X, y = X.float().to(device), y.to(device)
+            
+            logits = eval_model(X)[0]
+            val_preds.extend(logits.cpu().numpy())
+            val_targets.extend(y.argmax(dim=1).cpu().numpy())
+
+    oof_imu[val_idx] = val_preds
+    oof[val_idx] = val_preds2
+
+
+
+    h_f1 = CompetitionMetric().calculate_hierarchical_f1(
+        pd.DataFrame({'gesture': le.classes_[val_targets]}),
+        pd.DataFrame({'gesture': le.classes_[np.stack(val_preds, axis=0).argmax(axis=1)]})
+    )
+
+    all_h_f1 = CompetitionMetric().calculate_hierarchical_f1(
+        pd.DataFrame({'gesture': le.classes_[val_targets]}),
+        pd.DataFrame({'gesture': le.classes_[np.stack(val_preds2, axis=0).argmax(axis=1)]})
+    )
+
+    print(f"Fold {fold+1} H-F1 = {h_f1:.4f}")
+    print(f"Fold {fold+1} All H-F1 = {all_h_f1:.4f}")
+    print("\n")
+
+
+imu_h_f1 = CompetitionMetric().calculate_hierarchical_f1(
+    pd.DataFrame({'gesture': le.classes_[oof_imu.argmax(axis=1).astype(int)]}),
+    pd.DataFrame({'gesture': le.classes_[y_list_all.argmax(axis=1)]})
+)
+
+h_f1 = CompetitionMetric().calculate_hierarchical_f1(
+    pd.DataFrame({'gesture': le.classes_[oof.argmax(axis=1).astype(int)]}),
+    pd.DataFrame({'gesture': le.classes_[y_list_all.argmax(axis=1)]})
+)
+
+print(f"OOF H-F1 = {h_f1:.4f}")
+print(f"OOF IMU H-F1 = {imu_h_f1:.4f}")
+
+# %%
+pd.DataFrame(oof_imu, columns=['logit_' + col for col in list(le.classes_)]).to_csv(EXPORT_DIR / "oof_ver40_imu.csv", index=False)
 
 
