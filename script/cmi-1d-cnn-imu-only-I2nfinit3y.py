@@ -1,6 +1,5 @@
 # %%
 import os, json, joblib, numpy as np, pandas as pd
-os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 import random, math
 from pathlib import Path
 import warnings 
@@ -9,7 +8,6 @@ warnings.filterwarnings("ignore")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Function
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam, AdamW
 from torch.cuda.amp import GradScaler, autocast
@@ -25,6 +23,11 @@ from scipy.signal import firwin
 import sys
 sys.path.append("../metric")
 from cmi_metric import CompetitionMetric
+
+import torchvision
+
+# import tabm_reference as tabm
+
 from tqdm import tqdm
 from copy import deepcopy
 
@@ -32,14 +35,13 @@ from IPython.display import clear_output
 from functools import partial
 from scipy.spatial.transform import Rotation as R
 from types import SimpleNamespace
-
 from pytorch_metric_learning import losses, miners
 
 
-# Configuration
-TRAIN = True                     
+TRAIN = True                     # ← set to True when you want to train
 RAW_DIR = Path("../data")
-EXPORT_DIR = Path("../models")                                 
+EXPORT_DIR = Path("../models")  
+
 BATCH_SIZE = 64
 PAD_PERCENTILE = 100
 maxlen = PAD_PERCENTILE
@@ -47,7 +49,7 @@ LR_INIT = 1e-3
 WD = 3e-3
 MIXUP_ALPHA = 0.4
 MASKING_PROB = 0.25
-PATIENCE = 40
+PATIENCE = 30
 FOLDS = 5
 random_state = 42
 epochs_warmup = 20
@@ -68,11 +70,12 @@ class ImuFeatureExtractor(nn.Module):
         self.add_quaternion = add_quaternion
 
         k = 15
-        
+
         self.lpf_acc   = nn.Conv1d(3, 3, k, padding=k//2, groups=3, bias=False)
         nn.init.kaiming_normal_(self.lpf_acc.weight, mode='fan_out')
         self.lpf_gyro = nn.Conv1d(3, 3, k, padding=k//2, groups=3, bias=False)
         nn.init.kaiming_normal_(self.lpf_gyro.weight, mode='fan_out')
+ 
 
     def forward(self, imu):
         # imu: 
@@ -81,18 +84,19 @@ class ImuFeatureExtractor(nn.Module):
         gyro = imu[:, 4:7, :]                 # gyro_x, gyro_y, gyro_z
         linear_acc      = imu[:, 7:10, :]
         angular_vel     = imu[:, 10:13, :]
-        angular_distance = imu[:, 13:14, :] 
- 
+        angular_distance = imu[:, 13:14, :] # 保持维度 (B, 1, T)    
 
         # 线性加速度的幅度和jerk
         linear_acc_mag = torch.norm(linear_acc, dim=1, keepdim=True)
         linear_acc_mag_jerk = F.pad(linear_acc_mag[:, :, 1:] - linear_acc_mag[:, :, :-1], (1,0), 'replicate')  
 
+
         angular_vel_mag = torch.norm(angular_vel, dim=1, keepdim=True)
         angular_vel_mag_jerk = F.pad(angular_vel_mag[:, :, 1:] - angular_vel_mag[:, :, :-1], (1,0), 'replicate')  
 
-        rot_angle = 2 * torch.acos(imu[:, 3, :].clamp(-1.0, 1.0)).unsqueeze(1) 
+        rot_angle = 2 * torch.acos(imu[:, 3, :].clamp(-1.0, 1.0)).unsqueeze(1) # rot_w is the 4th comp
         rot_angle_vel = F.pad(rot_angle[:, :, 1:] - rot_angle[:, :, :-1], (1,0), 'replicate')
+
 
         # 1) magnitude
         acc_mag  = torch.norm(acc,  dim=1, keepdim=True)          # (B,1,T)
@@ -105,18 +109,22 @@ class ImuFeatureExtractor(nn.Module):
         # 3) energy
         acc_pow  = acc ** 2
         gyro_pow = gyro ** 2
+        # linear_acc_pow = linear_acc ** 2
 
         # 4) LPF / HPF 
         acc_lpf  = self.lpf_acc(acc)
         acc_hpf  = acc - acc_lpf
         gyro_lpf = self.lpf_gyro(gyro)
         gyro_hpf = gyro - gyro_lpf
+        # linear_acc_lpf = self.lpf_linear_acc(linear_acc)
+        # linear_acc_hpf = linear_acc - linear_acc_lpf
 
         acc_features = [
             acc, acc_mag,
             jerk, acc_pow,
             acc_lpf, acc_hpf,
             linear_acc, linear_acc_mag, linear_acc_mag_jerk,
+            # linear_acc_pow, linear_acc_lpf, linear_acc_hpf,
         ]
         gyro_features = [
             gyro, gyro_mag,
@@ -127,7 +135,7 @@ class ImuFeatureExtractor(nn.Module):
         ]
         # print(torch.cat(acc_features, dim=1).shape, torch.cat(gyro_features, dim=1).shape)
         features = acc_features + gyro_features
-        return torch.cat(features, dim=1)
+        return torch.cat(features, dim=1)  # (B, C_out, T)
 
 class SEBlock(nn.Module):
     def __init__(self, channels, reduction=8):
@@ -193,20 +201,8 @@ class ResidualSECNNBlock(nn.Module):
         
         return out
 
-class AttentionLayer(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.attention = nn.Linear(hidden_dim, 1)
-        
-    def forward(self, x):
-        # x shape: (batch, seq_len, hidden_dim)
-        scores = torch.tanh(self.attention(x))  # (batch, seq_len, 1)
-        weights = F.softmax(scores.squeeze(-1), dim=1)  # (batch, seq_len)
-        context = torch.sum(x * weights.unsqueeze(-1), dim=1)  # (batch, hidden_dim)
-        return context
-
 class TwoBranchModel(nn.Module):
-    def __init__(self, pad_len, imu_dim_raw, tof_dim, n_classes, dropouts=[0.3, 0.3, 0.3, 0.3, 0.4, 0.5, 0.3], 
+    def __init__(self, pad_len, imu_dim_raw, n_classes, dropouts=[0.3, 0.3, 0.3, 0.3, 0.4, 0.5, 0.3], 
                  feature_engineering=True, **kwargs):
         super().__init__()
         self.feature_engineering = feature_engineering
@@ -218,42 +214,18 @@ class TwoBranchModel(nn.Module):
             imu_dim = imu_dim_raw
             
         self.imu_dim = imu_dim
-        self.tof_dim = tof_dim
         self.fir_nchan = imu_dim_raw
         
 
-        # IMU deep branch
-        # self.imu_block1 = ResidualSECNNBlock(imu_dim, 64, 3, 1, dropout=dropouts[0])
-        # self.imu_block2 = ResidualSECNNBlock(64, 128, 5, 1, dropout=dropouts[1])
         self.acc_dim, self.rot_dim = 21, 24
         self.imu_block11 = ResidualSECNNBlock(self.acc_dim, 64, 3, 1, dropout=dropouts[0])
         self.imu_block12 = ResidualSECNNBlock(64, 128, 5, 1, dropout=dropouts[1])
         self.imu_block21 = ResidualSECNNBlock(self.rot_dim, 64, 3, 1, dropout=dropouts[0])
         self.imu_block22 = ResidualSECNNBlock(64, 128, 5, 1, dropout=dropouts[1])
-        
-        # TOF/Thermal lighter branch
-        # v1
-        # self.tof_conv1 = nn.Conv1d(tof_dim, 64, 3, padding=1, bias=False)
-        # self.tof_bn1 = nn.BatchNorm1d(64)
-        # self.tof_drop1 = nn.Dropout(dropouts[2])
-        
-        # self.tof_conv2 = nn.Conv1d(64, 128, 3, padding=1, bias=False)
-        # self.tof_bn2 = nn.BatchNorm1d(128)
-        # self.tof_drop2 = nn.Dropout(dropouts[3])
 
-        # v2
-        self.tof_conv1 = ResidualSECNNBlock(tof_dim, 64, 3, 1, dropout=dropouts[2])
-        self.tof_conv2 = ResidualSECNNBlock(64, 128, 3, 1, dropout=dropouts[3])
-
-    
-
-        # Gate
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.dense1_gate = nn.Linear(pad_len, 16)
-        self.dense2_gate = nn.Linear(16, 1)
         
 
-        merged_channels = 256 + 128
+        merged_channels = 256
         self.cnn_backbone1 = nn.Sequential(
             nn.Conv1d(merged_channels, 256, kernel_size=7, padding=3, bias=False),
             nn.BatchNorm1d(256),
@@ -267,9 +239,7 @@ class TwoBranchModel(nn.Module):
             nn.Dropout(dropouts[5])
         )
 
-        
 
-        # self.global_pool = AttentionLayer(512)
         self.global_pool = nn.AdaptiveAvgPool1d(1)  
 
 
@@ -284,68 +254,54 @@ class TwoBranchModel(nn.Module):
         
         self.classifier = nn.Linear(128, n_classes)
         
-    def forward(self, x):
+    def forward(self, imu):
 
-        imu = x[:, :, :self.fir_nchan].transpose(1, 2)  # (B, D_imu_raw, T)
-        tof = x[:, :, self.fir_nchan:].transpose(1, 2)  # (B, D_tof, T)
+        imu = imu.transpose(1, 2)  # (B, D_imu_raw, T)
 
-        imu  = self.imu_fe(imu)  # (B, D_imu, T)
+        imu = self.imu_fe(imu)  # (B, D_imu, T)
         
         
 
-        acc = imu[:, :self.acc_dim, :]  
+        acc = imu[:, :self.acc_dim, :]
         rot = imu[:, self.acc_dim:, :]  
         x11 = self.imu_block11(acc) # (B, 64, T)
-        x11 = self.imu_block12(x11) # (B, 128, T)
+        x11 = self.imu_block12(x11) # (B, 64, T)
         
         x12 = self.imu_block21(rot) # (B, 64, T)
-        x12 = self.imu_block22(x12) # (B, 128, T)
+        x12 = self.imu_block22(x12) # (B, 64, T)
         x1 = torch.cat([x11, x12], dim=1)
 
         
-        # TOF
-        
-        # v2
-        x2 = self.tof_conv1(tof)
-        x2 = self.tof_conv2(x2)
 
-        # Gate x2
-        gate_input = self.pool(tof.transpose(1, 2)).squeeze(-1)
-        gate_input = F.silu(self.dense1_gate(gate_input))
-    
-        gate = torch.sigmoid(self.dense2_gate(gate_input)) # -> (B, 1)
-        x2 = x2 * gate.unsqueeze(-1)
-        
-        merged = torch.cat([x1, x2], dim=1) # (B, 256, T)
+        merged = x1 # (B, 256, T)
         
 
         cnn_out = self.cnn_backbone1(merged) # (B, 256, T)
         cnn_out = self.cnn_backbone2(cnn_out) # (B, 512, T)
 
         
+
         pooled = self.global_pool(cnn_out) # (B, 512, 1)
+
         pooled_flat = torch.flatten(pooled, 1) # (B, 512)
-        # pooled_flat = self.global_pool(cnn_out.transpose(1, 2))
         
+
         x = F.silu(self.bn_dense1(self.dense1(pooled_flat)))
         x = self.drop1(x)
         x = F.silu(self.bn_dense2(self.dense2(x)))
         x = self.drop2(x)
         
         logits = self.classifier(x)
-        return logits, x, gate
-
+        return logits, x
 
 debug_model = TwoBranchModel(
     pad_len=100,
-    imu_dim_raw=14,
-    tof_dim=25,
-    n_classes=18,
+    imu_dim_raw=14,  # 6 channels for IMU      # 7 channels for TOF/Thermal
+    n_classes=18,   # 4 classes for classification
 ).to(device)
 
-debug_x = torch.randn(4, 100, 14+25).to(device)  # (batch_size, channels, seq_len)
+debug_x = torch.randn(4, 100, 14).to(device)  # (batch_size, channels, seq_len)
 debug_model(debug_x)[0].shape
-
 
 def remove_gravity_from_acc(acc_data, rot_data):
 
@@ -449,6 +405,8 @@ def calculate_angular_distance(rot_data):
             pass
             
     return angular_dist
+
+
 
 class SignalTransform:
     def __init__(self, always_apply: bool = False, p: float = 0.5):
@@ -557,7 +515,7 @@ class CMI3Dataset(Dataset):
                  y_list,
                  maxlen,
                  mode="train",
-                 imu_dim=14,
+                 imu_dim=17,
                  augment=None):
         self.X_list = X_list
         self.mode = mode
@@ -590,7 +548,7 @@ class CMI3Dataset(Dataset):
             X = self.augment(X, self.imu_dim)     
 
         X = self.pad_sequences_torch(X, self.maxlen, 'pre', 'pre')
-        return torch.from_numpy(X.copy()).float(), torch.from_numpy(y)
+        return torch.from_numpy(X).float(), torch.from_numpy(y)
     
     def __len__(self):
         return len(self.X_list)
@@ -761,12 +719,12 @@ def augment_left_handed_sequence(seq_df: pd.DataFrame) -> pd.DataFrame:
 
 set_seed(3407)
 
-
 def mixup_collate_fn(batch, alpha, imu_dim, masking_prob=0.0):
+
     X_batch = torch.stack([item[0] for item in batch])
     y_batch = torch.stack([item[1] for item in batch])
     
-    batch_size, seq_len, _ = X_batch.shape
+    batch_size = X_batch.shape[0]
 
 
     gate_target = torch.ones(batch_size, dtype=torch.float32)
@@ -779,46 +737,33 @@ def mixup_collate_fn(batch, alpha, imu_dim, masking_prob=0.0):
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
         perm = torch.randperm(batch_size)
-
-        if torch.rand(1) < 0.5:
-            X_mix = lam * X_batch + (1 - lam) * X_batch[perm]
-            y_mix = lam * y_batch + (1 - lam) * y_batch[perm]
-            gate_target_mix = lam * gate_target + (1 - lam) * gate_target[perm]
-        else:
-            cut_ratio = np.sqrt(1. - lam)
-            cut_len = int(seq_len * cut_ratio)
-            center_x = np.random.randint(seq_len)
-            start = np.clip(center_x - cut_len // 2, 0, seq_len)
-            end = np.clip(center_x + cut_len // 2, 0, seq_len)
-            lam = 1 - (end - start) / seq_len
-            
-            mask = torch.zeros_like(X_batch)
-            mask[:, start:end, :] = 1.0
-            X_mix = X_batch * (1. - mask) + X_batch[perm] * mask
-            y_mix = y_batch * lam + y_batch[perm] * (1. - lam)
-            gate_target_mix = lam * gate_target + (1 - lam) * gate_target[perm]
+        
+        # 应用 MixUp
+        X_mix = lam * X_batch + (1 - lam) * X_batch[perm]
+        y_mix = lam * y_batch + (1 - lam) * y_batch[perm]
+        gate_target_mix = lam * gate_target + (1 - lam) * gate_target[perm]
         
         return X_mix, y_mix, gate_target_mix
 
     return X_batch, y_batch, gate_target
 
+
+# ================================
+# Training Pipeline
+# ================================
 if TRAIN:
     print("▶ TRAIN MODE – loading dataset …")
     df = pd.read_csv(RAW_DIR / "train.csv")
     df_demo = (pd.read_csv(RAW_DIR / "train_demographics.csv"))[['subject', 'handedness']]
     df = df.merge(df_demo, on='subject', how='left')
-
     df = df[~df['subject'].isin(["SUBJ_045235", "SUBJ_019262"])].reset_index(drop=True)
-
     print("  Transform the left hand into right hand")
     df = df.groupby('sequence_id', group_keys=False).apply(augment_left_handed_sequence)
-
-
+    
     # Label encoding
     le = LabelEncoder()
     df['gesture_int'] = le.fit_transform(df['gesture'])
     np.save(EXPORT_DIR / "gesture_classes.npy", le.classes_)
-    
 
     # Feature list
     meta_cols = {'gesture', 'gesture_int', 'sequence_type', 'behavior', 'orientation',
@@ -845,7 +790,6 @@ if TRAIN:
         angular_vel_group = calculate_angular_velocity_from_quat(rot_data_group)
         angular_vel_list.append(pd.DataFrame(angular_vel_group, columns=['angular_vel_x', 'angular_vel_y', 'angular_vel_z'], index=group.index))
     df_angular_vel = pd.concat(angular_vel_list)
-   
 
     df = pd.concat([df, df_angular_vel], axis=1)
 
@@ -856,9 +800,9 @@ if TRAIN:
         angular_dist_group = calculate_angular_distance(rot_data_group)
         angular_distance_list.append(pd.DataFrame(angular_dist_group, columns=['angular_distance'], index=group.index))
     df_angular_distance = pd.concat(angular_distance_list)
-    
 
     df = pd.concat([df, df_angular_distance], axis=1)
+
 
 
     imu_cols_base = [c for c in feature_cols_meta if not (c.startswith('thm_') or c.startswith('tof_'))]
@@ -869,39 +813,21 @@ if TRAIN:
     imu_cols = imu_cols_base + imu_engineered_features
 
 
-    thm_cols_original = [c for c in df.columns if c.startswith('thm_')]
-    tof_aggregated_cols_template = []
-    stat_types = ['mean', 'std', 'min', 'max']
-    for i in range(1, 6):
-        tof_aggregated_cols_template.extend([f'tof_{i}_{stat}' for stat in stat_types])
-    # for i in range(1, 6):
-    #     tof_aggregated_cols_template.extend([f'tof_{i}_v{p}' for p in range(64)])
+   
+    feature_cols = imu_cols 
+    print(f"  IMU {len(imu_cols)} | total {len(feature_cols)} features")
 
-    tof_cols = thm_cols_original + tof_aggregated_cols_template
-    feature_cols = imu_cols + tof_cols
-    print(f"  IMU {len(imu_cols)} | TOF/THM {len(tof_cols)} | total {len(feature_cols)} features")
 
-    
     # Build sequences
     seq_gp = df.groupby('sequence_id')
     all_steps_for_scaler_list = []
-    X_list, y_list, id_list, hand_list, lens = [], [], [], [],[]
+    X_list, y_list, id_list, lens = [], [], [], []
     for seq_id, seq in tqdm(seq_gp):
         seq_df = seq.copy()
-        for i in range(1, 6):
-            pixel_cols_tof = [f"tof_{i}_v{p}" for p in range(64)]
-            tof_sensor_data = seq_df[pixel_cols_tof].replace(-1, np.nan)
-            seq_df[f'tof_{i}_mean'] = tof_sensor_data.mean(axis=1)
-            seq_df[f'tof_{i}_std']  = tof_sensor_data.std(axis=1)
-            seq_df[f'tof_{i}_min']  = tof_sensor_data.min(axis=1)
-            seq_df[f'tof_{i}_max']  = tof_sensor_data.max(axis=1)
-           
-
         mat = seq_df[feature_cols].ffill().bfill().fillna(0).values.astype('float32')
         all_steps_for_scaler_list.append(mat)
         X_list.append(mat)
         y_list.append(seq['gesture_int'].iloc[0].astype(np.int32))
-        hand_list.append(seq['handedness'].iloc[0])
         id_list.append(seq_id)
         lens.append(len(mat))
 
@@ -920,7 +846,6 @@ if TRAIN:
     np.save(EXPORT_DIR / "sequence_maxlen.npy", pad_len)
     np.save(EXPORT_DIR / "feature_cols.npy", np.array(feature_cols))
     id_list = np.array(id_list)
-    hand_list = np.array(hand_list)
     X_list_all = pad_sequences_torch(X_list, maxlen=pad_len, padding='pre', truncating='pre')
     y_list_all = np.eye(len(le.classes_))[y_list].astype(np.float32)  # One-hot encoding
 
@@ -929,6 +854,7 @@ if TRAIN:
         p_dropout=0.41782786013520684,
         p_moda=0.3910622476959722, drift_std=0.0040285239353308015, drift_max=0.3929358950258158    
     )
+
 
 metric_loss_fn = losses.TripletMarginLoss(margin=0.2) 
 miner = miners.TripletMarginMiner(margin=0.2, type_of_triplets="hard")
@@ -947,8 +873,10 @@ collate_fn_with_args = partial(mixup_collate_fn,
                                masking_prob=MASKING_PROB,
                                )
 skf = StratifiedGroupKFold(n_splits=FOLDS, shuffle=True, random_state=42)
+
 for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_type'].first(), groups=groups_by_subject)):
-        
+
+
     best_h_f1 = 0
     train_list= X_list_all[train_idx]
     train_y_list= y_list_all[train_idx]
@@ -961,16 +889,16 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
     # Data loaders
     train_dataset = CMI3Dataset(train_list, train_y_list, maxlen, mode="train", imu_dim=len(imu_cols),
                             augment=augmenter)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn_with_args, num_workers=4,drop_last=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn_with_args, num_workers=0,drop_last=True)
 
     val_dataset = CMI3Dataset(val_list, val_y_list, maxlen, mode="val")
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0,drop_last=False)
 
 
     # Model
-    model = TwoBranchModel(maxlen, len(imu_cols), len(tof_cols), 
+    model = TwoBranchModel(maxlen, len(imu_cols), 
                     len(le.classes_)).to(device)
-    ema = ModelEMA(model, decay=0.99)
+    ema = ModelEMA(model, decay=0.999)
     # Optimizer and scheduler
     optimizer = AdamW(model.parameters(), lr=LR_INIT, weight_decay=WD)
     steps_per_epoch = len(train_loader)
@@ -1007,13 +935,12 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
                                                             gate_target.to(device)
 
             optimizer.zero_grad()
-            logits, embedding, gate_pred = model(X)  # logits: (B, n_classes), gate_pred: (B, 1)
+            logits, embedding = model(X)  # logits: (B, n_classes), gate_pred: (B, 1)
 
             classification_loss = -torch.sum(F.log_softmax(logits, dim=1) * y, dim=1).mean()
             hard_triplets = miner(embedding, y.argmax(dim=1))
             metric_loss = metric_loss_fn(embedding, y.argmax(dim=1), hard_triplets)
-            loss = classification_loss + metric_loss+\
-                                0.2*F.binary_cross_entropy(gate_pred.squeeze(-1), gate_target)
+            loss = classification_loss + metric_loss
 
             loss.backward()
             optimizer.step()
@@ -1067,7 +994,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
             torch.save({
             'model_state_dict': ema.module.state_dict(),
             'imu_dim': len(imu_cols),
-            'tof_dim': len(tof_cols),
             'n_classes': len(le.classes_),
             'pad_len': pad_len
             }, EXPORT_DIR / f"gesture_two_branch_fold{fold}.pth")
@@ -1088,25 +1014,29 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
     print(f"fold: {fold} val_all_acc: {best_h_f1:.4f}")
     print("✔ Training done – artefacts saved in", EXPORT_DIR)
 
-groups_by_subject = seq_gp['subject'].first()
 
-skf = StratifiedGroupKFold(n_splits=FOLDS, shuffle=True, random_state=42)
+from cmi_metric import CompetitionMetric
+
+
+groups_by_subject = seq_gp['subject'].first()
 
 oof = np.zeros((X_list_all.shape[0], ), dtype=np.float32)
 oof_imu = np.zeros((X_list_all.shape[0], ))
+
+skf = StratifiedGroupKFold(n_splits=FOLDS, shuffle=True, random_state=42)
 for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_type'].first(), groups=groups_by_subject)):
     _, val_list = X_list_all[train_idx], X_list_all[val_idx]
     _, val_y_list = y_list_all[train_idx], y_list_all[val_idx]
 
     val_dataset = CMI3Dataset(val_list, val_y_list, maxlen, mode="val")
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0,drop_last=False)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4,drop_last=False)
     
 
-    # best_model_path = Path("/kaggle/input/cmi-clear-imu-only") / f"exp172_gesture_two_branch_fold{fold}.pth"
+    # best_model_path = Path("exp66") / f"exp66_gesture_two_branch_fold{fold}.pth"
     best_model_path = EXPORT_DIR/ f"gesture_two_branch_fold{fold}.pth"
     print(f"Evaluating fold {fold+1} with model {best_model_path}")
     
-    eval_model = TwoBranchModel(maxlen, len(imu_cols), len(tof_cols), 
+    eval_model = TwoBranchModel(maxlen, len(imu_cols), 
                     len(le.classes_)).to(device)
     eval_model.load_state_dict(torch.load(best_model_path, map_location=device)['model_state_dict'])
     eval_model.to(device)
@@ -1163,13 +1093,11 @@ h_f1 = CompetitionMetric().calculate_hierarchical_f1(
 print(f"OOF H-F1 = {h_f1:.4f}")
 print(f"OOF IMU H-F1 = {imu_h_f1:.4f}")
 
-
 (imu_h_f1 + h_f1) / 2
 
+trian_dem = pd.read_csv(RAW_DIR / "train_demographics.csv")
 
-trian_dem = pd.read_csv("/kaggle/input/cmi-detect-behavior-with-sensor-data/train_demographics.csv")
 subject_handedness = trian_dem.set_index('subject')['handedness'].to_dict()
-
 
 handedness_filtered = groups_by_subject.map(subject_handedness)
 handedness_filtered = handedness_filtered.reset_index(drop=True)
