@@ -1229,21 +1229,16 @@ print(f"OOF H-F1 = {h_f1:.4f}")
 print(f"OOF IMU H-F1 = {imu_h_f1:.4f}")
 
 
-# Fold 5 ori
-
-# OOF H-F1 = 0.8758
-# OOF IMU H-F1 = 0.8491
-
-# 0.8624691571465476
-
-# Right Handed OOF H-F1 = 0.8802
-# Right Handed OOF IMU H-F1 = 0.8534
-# Right Handed OOF H-F1 + IMU H-F1 = 0.8668
+# OOF H-F1 = 0.8813
+# OOF IMU H-F1 = 0.8548
+# Right Handed OOF H-F1 = 0.8852
+# Right Handed OOF IMU H-F1 = 0.8589
+# Right Handed OOF H-F1 + IMU H-F1 = 0.8720
 
 
-# Left Handed OOF H-F1 = 0.8463
-# Left Handed OOF IMU H-F1 = 0.8197
-# Left Handed OOF H-F1 + IMU H-F1 = 0.8330
+# Left Handed OOF H-F1 = 0.8547
+# Left Handed OOF IMU H-F1 = 0.8269
+# Left Handed OOF H-F1 + IMU H-F1 = 0.8408
 
 (imu_h_f1 + h_f1) / 2
 

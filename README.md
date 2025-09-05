@@ -56,4 +56,5 @@ please check the `./others` fold
 | cmi-1d-cnn-imu-only-I2nfinit3y.py | 0.8336 | 0.835     | 0.818      |
 | XXX-CMI-ver37-top.py              | 0.8785 | 0.853     | 0.848      |
 | XXX-CMI-ver40-top.py              | 0.8758 | 0.855     | 0.843      |
+| XXX-CMI-ver27-top.py              | 0.8813 | /         | /          |
 
