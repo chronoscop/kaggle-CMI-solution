@@ -1,4 +1,4 @@
-# %%
+
 import os, json, joblib, numpy as np, pandas as pd
 import random, math
 from pathlib import Path
@@ -1032,7 +1032,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(id_list, seq_gp['sequence_
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4,drop_last=False)
     
 
-    # best_model_path = Path("exp66") / f"exp66_gesture_two_branch_fold{fold}.pth"
     best_model_path = EXPORT_DIR/ f"gesture_two_branch_fold{fold}.pth"
     print(f"Evaluating fold {fold+1} with model {best_model_path}")
     
@@ -1139,4 +1138,13 @@ print(f"Left Handed OOF H-F1 = {left_h_f1:.4f}")
 print(f"Left Handed OOF IMU H-F1 = {left_imu_h_f1:.4f}")
 print(f"Left Handed OOF H-F1 + IMU H-F1 = {(left_h_f1 + left_imu_h_f1) / 2:.4f}")
 
+# OOF H-F1 = 0.8336
+# OOF IMU H-F1 = 0.8336
+# Right Handed OOF H-F1 = 0.8361
+# Right Handed OOF IMU H-F1 = 0.8361
+# Right Handed OOF H-F1 + IMU H-F1 = 0.8361
 
+
+# Left Handed OOF H-F1 = 0.8160
+# Left Handed OOF IMU H-F1 = 0.8160
+# Left Handed OOF H-F1 + IMU H-F1 = 0.8160
