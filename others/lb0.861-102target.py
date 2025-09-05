@@ -1229,11 +1229,9 @@ h_f1 = CompetitionMetric().calculate_hierarchical_f1(
 print(f"OOF H-F1 = {h_f1:.4f}")
 print(f"OOF IMU H-F1 = {imu_h_f1:.4f}")
 
-# %%
 (imu_h_f1 + h_f1) / 2
 
-# %%
-trian_dem = pd.read_csv("/kaggle/input/cmi-detect-behavior-with-sensor-data/train_demographics.csv")
+trian_dem = pd.read_csv(RAW_DIR / "train_demographics.csv")
 subject_handedness = trian_dem.set_index('subject')['handedness'].to_dict()
 
 
